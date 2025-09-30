@@ -17,49 +17,48 @@ SUMMARY (EN):
 */
 
 var host = Host.CreateDefaultBuilder(args)
-    .ConfigureAppConfiguration(cfg =>
-    {
-        cfg.AddJsonFile("appsettings.json", optional: true, reloadOnChange: true)
-           .AddUserSecrets<Program>(optional: true)   // DISCORD_TOKEN can live here locally
-           .AddEnvironmentVariables();                // and in production via env vars
-    })
-    .ConfigureLogging(l => l.ClearProviders().AddConsole())
-    .ConfigureServices((ctx, s) =>
-    {
-        var intents = GatewayIntents.Guilds | GatewayIntents.GuildMembers | GatewayIntents.GuildVoiceStates;
-        s.AddSingleton(new DiscordSocketClient(new DiscordSocketConfig
-        {
-            GatewayIntents = intents,
-            LogLevel = LogSeverity.Info,
-            MessageCacheSize = 0,
-            AlwaysDownloadUsers = false
-        }));
+  .ConfigureAppConfiguration(cfg => cfg
+    .AddJsonFile("appsettings.json", optional: true, reloadOnChange: true)
+    .AddUserSecrets<Program>(optional: true)
+    .AddEnvironmentVariables())
+  .ConfigureLogging(l => l.ClearProviders().AddConsole())
+  .ConfigureServices((ctx, s) =>
+{
+    var intents = GatewayIntents.Guilds
+               | GatewayIntents.GuildMembers
+               | GatewayIntents.GuildVoiceStates
+               | GatewayIntents.GuildMessageReactions; // needed for reaction roles
 
-        // InteractionService needs the client in its ctor
-        s.AddSingleton(sp => new InteractionService(sp.GetRequiredService<DiscordSocketClient>()));
+    s.AddSingleton(new DiscordSocketClient(new DiscordSocketConfig
+    {
+        GatewayIntents = intents,
+        LogLevel = LogSeverity.Info,
+        MessageCacheSize = 0,
+        AlwaysDownloadUsers = false
+    }));
+    s.AddSingleton(sp => new InteractionService(sp.GetRequiredService<DiscordSocketClient>()));
 
-        s.AddSingleton<ISettingsStore, FileSettingsStore>();
-        s.AddHostedService<TempVoiceService>();
-        s.AddHostedService<BotRunner>();
-    })
-    .Build();
+    s.AddSingleton<ISettingsStore, FileSettingsStore>();
+    s.AddHostedService<TempVoiceService>();
+    s.AddHostedService<ReactionRoleService>();  // NEW
+    s.AddHostedService<BotRunner>();
+})
+  .Build();
 
 await host.RunAsync();
 
 public sealed class BotRunner(
-    DiscordSocketClient client,
-    InteractionService interactions,
-    IServiceProvider services,
-    IConfiguration cfg,
-    ILogger<BotRunner> log) : BackgroundService
+  DiscordSocketClient client,
+  InteractionService interactions,
+  IServiceProvider services,
+  IConfiguration cfg,
+  ILogger<BotRunner> log) : BackgroundService
 {
-    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    protected override async Task ExecuteAsync(CancellationToken ct)
     {
-        // Logging hooks
         client.Log += m => { log.LogInformation("{Src} {Msg}", m.Source, m.Message); return Task.CompletedTask; };
         interactions.Log += m => { log.LogInformation("{Src} {Msg}", m.Source, m.Message); return Task.CompletedTask; };
 
-        // Discord events
         client.Ready += OnReady;
         client.JoinedGuild += g => RegisterForGuildAsync(g.Id);
         client.InteractionCreated += async inter =>
@@ -68,44 +67,29 @@ public sealed class BotRunner(
             await interactions.ExecuteCommandAsync(ctx, services);
         };
 
-        // Load all Interaction modules from this assembly
         await interactions.AddModulesAsync(Assembly.GetExecutingAssembly(), services);
 
-        // Login + start
         var token = cfg["DISCORD_TOKEN"] ?? throw new InvalidOperationException("DISCORD_TOKEN missing.");
         await client.LoginAsync(TokenType.Bot, token);
         await client.StartAsync();
 
-        try { await Task.Delay(Timeout.Infinite, stoppingToken); } catch (TaskCanceledException) { }
+        try { await Task.Delay(Timeout.Infinite, ct); } catch { }
     }
 
     private async Task OnReady()
     {
-        try
-        {
-            // Register commands to every guild the bot is currently in
-            foreach (var g in client.Guilds)
-                await RegisterForGuildAsync(g.Id);
-
-            log.LogInformation("Slash-commands registered for {Count} guild(s).", client.Guilds.Count);
-        }
-        catch (Exception ex)
-        {
-            log.LogError(ex, "Ready handler failed");
-        }
+        foreach (var g in client.Guilds)
+            await RegisterForGuildAsync(g.Id);
+        log.LogInformation("Slash-commands registered for {Count} guild(s).", client.Guilds.Count);
     }
 
-    private async Task RegisterForGuildAsync(ulong guildId)
-    {
-        // NOTE: Per-guild registration propagates instantly and keeps guilds independent.
-        await interactions.RegisterCommandsToGuildAsync(guildId);
-        log.LogInformation("Commands registered for guild {GuildId}", guildId);
-    }
+    private Task RegisterForGuildAsync(ulong guildId)
+        => interactions.RegisterCommandsToGuildAsync(guildId);
 
-    public override async Task StopAsync(CancellationToken cancellationToken)
+    public override async Task StopAsync(CancellationToken ct)
     {
         await client.StopAsync();
         await client.LogoutAsync();
-        await base.StopAsync(cancellationToken);
+        await base.StopAsync(ct);
     }
 }

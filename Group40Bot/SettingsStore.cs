@@ -5,66 +5,224 @@ using Microsoft.Extensions.Logging;
 
 namespace Group40Bot;
 
-/*
-SUMMARY (EN):
-- Simple file-based store: per-guild set of lobby voice-channel IDs.
-- Thread-safe via SemaphoreSlim. Data persisted to DATA_DIR/settings.json.
-- This keeps configurations cleanly separated across guilds.
-*/
-
+/// <summary>
+/// Abstraction for guild-scoped settings:
+/// - Temp voice lobbies per guild
+/// - Reaction-role messages per guild
+/// </summary>
 public interface ISettingsStore
 {
+    // Temp-voice
     Task<HashSet<ulong>> GetLobbiesAsync(ulong guildId);
     Task AddLobbyAsync(ulong guildId, ulong channelId);
     Task RemoveLobbyAsync(ulong guildId, ulong channelId);
+
+    // Reaction-roles
+    Task AddReactionRoleAsync(ReactionRoleEntry entry);
+    Task RemoveReactionRoleAsync(ulong guildId, ulong messageId);
+    Task<ReactionRoleEntry?> GetReactionRoleByMessageAsync(ulong guildId, ulong messageId);
+    Task<List<ReactionRoleEntry>> ListReactionRolesAsync(ulong guildId);
 }
 
+/// <summary>
+/// File-backed implementation suited for servers:
+/// - Resolves a stable data directory
+/// - Logs the absolute file path
+/// - Backs up corrupt JSON and starts empty
+/// - Writes atomically (temp + replace)
+/// - Backward compatible to legacy lobby-only JSON
+/// </summary>
 public sealed class FileSettingsStore : ISettingsStore
 {
     private readonly string _file;
     private readonly ILogger<FileSettingsStore> _log;
     private readonly SemaphoreSlim _lock = new(1, 1);
-    private ConcurrentDictionary<ulong, HashSet<ulong>> _map = new();
+    private SettingsRoot _root = new();
 
     public FileSettingsStore(IConfiguration cfg, ILogger<FileSettingsStore> log)
     {
         _log = log;
-        var root = Environment.GetEnvironmentVariable("DATA_DIR") ?? cfg["DataDir"] ?? "./data";
-        Directory.CreateDirectory(root);
-        _file = Path.Combine(root, "settings.json");
 
-        if (File.Exists(_file))
+        var dir = ResolveDataDir(cfg);
+        Directory.CreateDirectory(dir);
+
+        _file = Path.Combine(dir, "settings.json");
+        _log.LogInformation("Settings file: {Path}", _file);
+
+        if (!File.Exists(_file))
+            return;
+
+        try
         {
-            try
+            var json = File.ReadAllText(_file);
+            // Try new schema
+            _root = JsonSerializer.Deserialize<SettingsRoot>(json) ?? new SettingsRoot();
+
+            // Back-compat: legacy file was Dictionary<guildId, HashSet<lobbyIds>>
+            if (_root.Lobbies.Count == 0 && _root.ReactionRoles.Count == 0)
             {
-                var json = File.ReadAllText(_file);
-                var data = JsonSerializer.Deserialize<Dictionary<ulong, HashSet<ulong>>>(json);
-                if (data != null) _map = new(data);
+                var legacy = JsonSerializer.Deserialize<Dictionary<ulong, HashSet<ulong>>>(json);
+                if (legacy != null) _root.Lobbies = legacy;
             }
-            catch (Exception ex) { _log.LogWarning(ex, "Failed to load settings; starting empty"); }
+        }
+        catch (JsonException ex)
+        {
+            var backup = _file + $".corrupt-{DateTime.UtcNow:yyyyMMddHHmmss}.json";
+            try { File.Move(_file, backup, true); }
+            catch { /* ignore */ }
+            _log.LogWarning(ex, "Settings corrupted. Moved to {Backup}. Starting empty.", backup);
+            _root = new SettingsRoot();
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "Failed to load settings; starting empty");
+            _root = new SettingsRoot();
         }
     }
 
+    /// <summary>
+    /// Resolve data directory using env var first, then config, then OS-specific default.
+    /// </summary>
+    private static string ResolveDataDir(IConfiguration cfg)
+    {
+        var env = Environment.GetEnvironmentVariable("DATA_DIR");
+        if (!string.IsNullOrWhiteSpace(env)) return env;
+
+        var cfgDir = cfg["DataDir"];
+        if (!string.IsNullOrWhiteSpace(cfgDir)) return cfgDir;
+
+        if (OperatingSystem.IsWindows())
+            return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Group40Bot");
+
+        var xdg = Environment.GetEnvironmentVariable("XDG_DATA_HOME");
+        if (!string.IsNullOrWhiteSpace(xdg))
+            return Path.Combine(xdg, "Group40Bot");
+
+        return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".local", "share", "Group40Bot");
+    }
+
+    /// <summary>
+    /// Write the JSON atomically: temp file + replace.
+    /// </summary>
+    private void Save()
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(_file)!);
+        var json = JsonSerializer.Serialize(_root, new JsonSerializerOptions { WriteIndented = true });
+
+        var tmp = _file + ".tmp";
+        File.WriteAllText(tmp, json);
+        // Atomic replace if supported; fallback to move.
+        try { File.Replace(tmp, _file, null); }
+        catch
+        {
+            if (File.Exists(_file)) File.Delete(_file);
+            File.Move(tmp, _file);
+        }
+    }
+
+    // -------- Temp-voice --------
     public Task<HashSet<ulong>> GetLobbiesAsync(ulong guildId) =>
-        Task.FromResult(_map.TryGetValue(guildId, out var v) ? new HashSet<ulong>(v) : new());
+        Task.FromResult(_root.Lobbies.TryGetValue(guildId, out var v) ? new HashSet<ulong>(v) : new());
 
     public async Task AddLobbyAsync(ulong guildId, ulong channelId)
     {
         await _lock.WaitAsync();
-        try { _map.GetOrAdd(guildId, _ => new()).Add(channelId); Save(); }
+        try
+        {
+            if (!_root.Lobbies.TryGetValue(guildId, out var set))
+                _root.Lobbies[guildId] = set = new HashSet<ulong>();
+            set.Add(channelId);
+            Save();
+        }
         finally { _lock.Release(); }
     }
 
     public async Task RemoveLobbyAsync(ulong guildId, ulong channelId)
     {
         await _lock.WaitAsync();
-        try { if (_map.TryGetValue(guildId, out var s)) { s.Remove(channelId); Save(); } }
+        try
+        {
+            if (_root.Lobbies.TryGetValue(guildId, out var set))
+            {
+                set.Remove(channelId);
+                Save();
+            }
+        }
         finally { _lock.Release(); }
     }
 
-    private void Save()
+    // -------- Reaction-roles --------
+    public async Task AddReactionRoleAsync(ReactionRoleEntry entry)
     {
-        var json = JsonSerializer.Serialize(_map, new JsonSerializerOptions { WriteIndented = true });
-        File.WriteAllText(_file, json);
+        await _lock.WaitAsync();
+        try
+        {
+            if (!_root.ReactionRoles.TryGetValue(entry.GuildId, out var list))
+                _root.ReactionRoles[entry.GuildId] = list = new List<ReactionRoleEntry>();
+
+            var idx = list.FindIndex(x => x.MessageId == entry.MessageId);
+            if (idx >= 0) list[idx] = entry; else list.Add(entry);
+
+            Save();
+        }
+        finally { _lock.Release(); }
     }
+
+    public async Task RemoveReactionRoleAsync(ulong guildId, ulong messageId)
+    {
+        await _lock.WaitAsync();
+        try
+        {
+            if (_root.ReactionRoles.TryGetValue(guildId, out var list))
+            {
+                list.RemoveAll(x => x.MessageId == messageId);
+                Save();
+            }
+        }
+        finally { _lock.Release(); }
+    }
+
+    public Task<ReactionRoleEntry?> GetReactionRoleByMessageAsync(ulong guildId, ulong messageId)
+    {
+        if (_root.ReactionRoles.TryGetValue(guildId, out var list))
+            return Task.FromResult<ReactionRoleEntry?>(list.FirstOrDefault(x => x.MessageId == messageId));
+        return Task.FromResult<ReactionRoleEntry?>(null);
+    }
+
+    public Task<List<ReactionRoleEntry>> ListReactionRolesAsync(ulong guildId)
+    {
+        if (_root.ReactionRoles.TryGetValue(guildId, out var list))
+            return Task.FromResult(list.ToList());
+        return Task.FromResult(new List<ReactionRoleEntry>());
+    }
+}
+
+// ---------------- Data models ----------------
+
+/// <summary>Root JSON document persisted to disk.</summary>
+public sealed class SettingsRoot
+{
+    public Dictionary<ulong, HashSet<ulong>> Lobbies { get; set; } = new();
+    public Dictionary<ulong, List<ReactionRoleEntry>> ReactionRoles { get; set; } = new();
+}
+
+/// <summary>One reaction-role message and its mapping.</summary>
+public sealed class ReactionRoleEntry
+{
+    public ulong GuildId { get; set; }
+    public ulong ChannelId { get; set; }
+    public ulong MessageId { get; set; }
+    public bool RemoveOnUnreact { get; set; }
+    public List<ReactionRolePair> Pairs { get; set; } = new();
+}
+
+/// <summary>Mapping from a single emoji to a role.</summary>
+public sealed class ReactionRolePair
+{
+    public string EmojiKey { get; set; } = "";
+    public ulong RoleId { get; set; }
+    public string? EmojiRaw { get; set; }
+    public ReactionRolePair() { }
+    public ReactionRolePair(string emojiKey, ulong roleId, string? emojiRaw)
+        => (EmojiKey, RoleId, EmojiRaw) = (emojiKey, roleId, emojiRaw);
 }
