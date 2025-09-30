@@ -24,3 +24,16 @@ Purpose: Manage **temporary voice channels** per guild and provide admin-only sl
 # install .NET 8 SDK first
 dotnet restore
 dotnet run --project Group40Bot/Group40Bot.csproj
+```
+
+## LICENSE
+```text
+Copyright (c) Group 40. All rights reserved.
+
+Permission is hereby NOT granted to use, copy, modify, merge, publish, distribute,
+sublicense, and/or sell copies of this software without explicit written permission
+from Group 40.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT.
