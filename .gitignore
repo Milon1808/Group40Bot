@@ -416,3 +416,13 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+
+/out/
+/bin/
+/obj/
+/.vscode/
+/.idea/
+/.vs/
+/data/
+/.secrets/
+/.env
