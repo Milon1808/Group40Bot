@@ -5,6 +5,12 @@ using Microsoft.Extensions.Logging;
 
 namespace Group40Bot;
 
+/// <summary>
+/// Runtime handler for reaction-role messages:
+/// - Adds role on reaction add
+/// - Optionally removes role on reaction remove
+/// - Cleans mapping when the message gets deleted
+/// </summary>
 public sealed class ReactionRoleService(DiscordSocketClient client, ISettingsStore store, ILogger<ReactionRoleService> log)
     : BackgroundService
 {

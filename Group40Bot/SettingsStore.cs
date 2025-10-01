@@ -25,12 +25,12 @@ public interface ISettingsStore
 }
 
 /// <summary>
-/// File-backed implementation suited for servers:
-/// - Resolves a stable data directory
+/// File-backed implementation designed for servers:
+/// - Resolves a stable data directory (ENV -> config -> OS default)
 /// - Logs the absolute file path
 /// - Backs up corrupt JSON and starts empty
-/// - Writes atomically (temp + replace)
-/// - Backward compatible to legacy lobby-only JSON
+/// - Atomic write (temp + replace)
+/// - Backward compatible with legacy lobby-only schema
 /// </summary>
 public sealed class FileSettingsStore : ISettingsStore
 {
@@ -55,10 +55,9 @@ public sealed class FileSettingsStore : ISettingsStore
         try
         {
             var json = File.ReadAllText(_file);
-            // Try new schema
             _root = JsonSerializer.Deserialize<SettingsRoot>(json) ?? new SettingsRoot();
 
-            // Back-compat: legacy file was Dictionary<guildId, HashSet<lobbyIds>>
+            // Back-compat: legacy was Dictionary<guildId, HashSet<lobbyIds>>
             if (_root.Lobbies.Count == 0 && _root.ReactionRoles.Count == 0)
             {
                 var legacy = JsonSerializer.Deserialize<Dictionary<ulong, HashSet<ulong>>>(json);
@@ -68,8 +67,7 @@ public sealed class FileSettingsStore : ISettingsStore
         catch (JsonException ex)
         {
             var backup = _file + $".corrupt-{DateTime.UtcNow:yyyyMMddHHmmss}.json";
-            try { File.Move(_file, backup, true); }
-            catch { /* ignore */ }
+            try { File.Move(_file, backup, true); } catch { }
             _log.LogWarning(ex, "Settings corrupted. Moved to {Backup}. Starting empty.", backup);
             _root = new SettingsRoot();
         }
@@ -80,9 +78,7 @@ public sealed class FileSettingsStore : ISettingsStore
         }
     }
 
-    /// <summary>
-    /// Resolve data directory using env var first, then config, then OS-specific default.
-    /// </summary>
+    /// <summary>Resolve data directory: ENV:DATA_DIR -> config:DataDir -> OS default.</summary>
     private static string ResolveDataDir(IConfiguration cfg)
     {
         var env = Environment.GetEnvironmentVariable("DATA_DIR");
@@ -101,9 +97,7 @@ public sealed class FileSettingsStore : ISettingsStore
         return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".local", "share", "Group40Bot");
     }
 
-    /// <summary>
-    /// Write the JSON atomically: temp file + replace.
-    /// </summary>
+    /// <summary>Atomic write: temp file + replace to avoid torn writes.</summary>
     private void Save()
     {
         Directory.CreateDirectory(Path.GetDirectoryName(_file)!);
@@ -111,7 +105,6 @@ public sealed class FileSettingsStore : ISettingsStore
 
         var tmp = _file + ".tmp";
         File.WriteAllText(tmp, json);
-        // Atomic replace if supported; fallback to move.
         try { File.Replace(tmp, _file, null); }
         catch
         {
@@ -197,8 +190,6 @@ public sealed class FileSettingsStore : ISettingsStore
     }
 }
 
-// ---------------- Data models ----------------
-
 /// <summary>Root JSON document persisted to disk.</summary>
 public sealed class SettingsRoot
 {
@@ -206,7 +197,7 @@ public sealed class SettingsRoot
     public Dictionary<ulong, List<ReactionRoleEntry>> ReactionRoles { get; set; } = new();
 }
 
-/// <summary>One reaction-role message and its mapping.</summary>
+/// <summary>One reaction-role message and its emoji-to-role mapping.</summary>
 public sealed class ReactionRoleEntry
 {
     public ulong GuildId { get; set; }
@@ -216,7 +207,7 @@ public sealed class ReactionRoleEntry
     public List<ReactionRolePair> Pairs { get; set; } = new();
 }
 
-/// <summary>Mapping from a single emoji to a role.</summary>
+/// <summary>Mapping from a single emoji key to a role id.</summary>
 public sealed class ReactionRolePair
 {
     public string EmojiKey { get; set; } = "";

@@ -10,10 +10,9 @@ using Microsoft.Extensions.Logging;
 
 /*
 SUMMARY (EN):
-- Bootstraps a .NET Generic Host with DI, logging, and configuration sources.
-- Wires up DiscordSocketClient and InteractionService.
-- BotRunner logs in, loads modules, registers slash-commands per guild on Ready and when joining new guilds.
-- No TEST_GUILD_ID needed; commands deploy instantly per guild.
+- Bootstraps a .NET Generic Host with DI, logging, and configuration.
+- Registers DiscordSocketClient and InteractionService.
+- Starts the bot via BotRunner; registers slash-commands per guild on Ready and when joining new guilds.
 */
 var host = Host.CreateDefaultBuilder(args)
     // ===== LOGGING: console sink + minimum level =====
@@ -29,7 +28,7 @@ var host = Host.CreateDefaultBuilder(args)
     // ===== DEPENDENCY INJECTION / SERVICES =====
     .ConfigureServices((ctx, s) =>
     {
-        // NOTE: GuildMembers intent must be enabled in the Developer Portal if kept here.
+        // NOTE: Keep GuildMembers intent only if enabled in the Developer Portal.
         var intents = GatewayIntents.Guilds
                    | GatewayIntents.GuildMembers
                    | GatewayIntents.GuildVoiceStates
@@ -43,12 +42,12 @@ var host = Host.CreateDefaultBuilder(args)
             AlwaysDownloadUsers = false
         }));
 
-        // InteractionService needs the client in its constructor
+        // InteractionService requires the client in its ctor
         s.AddSingleton(sp => new InteractionService(sp.GetRequiredService<DiscordSocketClient>()));
 
         s.AddSingleton<ISettingsStore, FileSettingsStore>();
         s.AddHostedService<TempVoiceService>();
-        s.AddHostedService<ReactionRoleService>();   // enable if you use reaction roles
+        s.AddHostedService<ReactionRoleService>();
         s.AddHostedService<BotRunner>();
     })
     .Build();
@@ -56,8 +55,8 @@ var host = Host.CreateDefaultBuilder(args)
 await host.RunAsync();
 
 /// <summary>
-/// Background service that owns the Discord client lifecycle:
-/// logging hooks, module loading, command execution, and per-guild registration.
+/// Owns Discord client lifecycle: hooks logging, loads modules,
+/// handles interaction dispatching, and per-guild command registration.
 /// </summary>
 public sealed class BotRunner(
     DiscordSocketClient client,
@@ -72,22 +71,16 @@ public sealed class BotRunner(
         client.Log += m => { log.LogInformation("{Src} {Msg}", m.Source, m.Message); return Task.CompletedTask; };
         interactions.Log += m => { log.LogInformation("{Src} {Msg}", m.Source, m.Message); return Task.CompletedTask; };
 
-        // ===== LOGGING: connection diagnostics (connect/disconnect; WS close code when available) =====
-        client.Connected += () =>
-        {
-            log.LogInformation("Connected");
-            return Task.CompletedTask;
-        };
+        // ===== LOGGING: connection diagnostics =====
+        client.Connected += () => { log.LogInformation("Connected"); return Task.CompletedTask; };
         client.Disconnected += ex =>
         {
             switch (ex)
             {
                 case Discord.Net.WebSocketClosedException wse:
-                    // CloseCode + Reason available here
                     log.LogError("Disconnected: CloseCode={Code} Reason={Reason}", wse.CloseCode, wse.Reason);
                     break;
                 default:
-                    // No close code available (e.g., other exceptions)
                     log.LogError(ex, "Disconnected: {Type}", ex?.GetType().Name ?? "unknown");
                     break;
             }
@@ -98,7 +91,7 @@ public sealed class BotRunner(
         client.GuildAvailable += g => { log.LogInformation("Guild available: {Name} ({Id})", g.Name, g.Id); return Task.CompletedTask; };
         client.GuildUnavailable += g => { log.LogWarning("Guild unavailable: {Name} ({Id})", g.Name, g.Id); return Task.CompletedTask; };
 
-        // ===== LOGGING: slash command results =====
+        // ===== LOGGING: slash result =====
         interactions.SlashCommandExecuted += (info, ctx, result) =>
         {
             if (!result.IsSuccess)
@@ -108,7 +101,7 @@ public sealed class BotRunner(
             return Task.CompletedTask;
         };
 
-        // ===== EVENTS: ready / joined guild / interaction dispatch =====
+        // ===== EVENTS =====
         client.Ready += OnReady;
         client.JoinedGuild += g => RegisterForGuildAsync(g.Id);
         client.InteractionCreated += async inter =>
@@ -139,7 +132,6 @@ public sealed class BotRunner(
         }
         catch (Exception ex)
         {
-            // ===== LOGGING: ready handler errors =====
             log.LogError(ex, "Ready handler failed");
         }
     }

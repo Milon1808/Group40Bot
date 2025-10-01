@@ -4,12 +4,10 @@ using Discord.Interactions;
 
 namespace Group40Bot;
 
-/*
-SUMMARY (EN):
-- Global /help command.
-- Builds a list of all registered slash commands (including grouped ones) and posts it publicly in the channel.
-*/
-
+/// <summary>
+/// Global /help command. Builds full syntax for all slash commands.
+/// Replies ephemeral to avoid channel noise.
+/// </summary>
 public sealed class CoreModule(InteractionService svc) : InteractionModuleBase<SocketInteractionContext>
 {
     [SlashCommand("help", "Shows all available commands with syntax")]
@@ -32,10 +30,9 @@ public sealed class CoreModule(InteractionService svc) : InteractionModuleBase<S
             {
                 var path = c.Module.SlashGroupName is null ? $"/{c.Name}" : $"/{c.Module.SlashGroupName} {c.Name}";
                 var args = c.Parameters.Count == 0 ? ""
-                  : " " + string.Join(" ", c.Parameters.Select(p =>
-                        p.IsRequired
-                          ? $"{p.Name}:<{Pretty(p.ParameterType.Name)}>"
-                          : $"[{p.Name}:<{Pretty(p.ParameterType.Name)}>]"));
+                    : " " + string.Join(" ", c.Parameters.Select(p =>
+                        p.IsRequired ? $"{p.Name}:<{Pretty(p.ParameterType.Name)}>"
+                                     : $"[{p.Name}:<{Pretty(p.ParameterType.Name)}>]"));
                 var desc = string.IsNullOrWhiteSpace(c.Description) ? "" : $" — {c.Description}";
                 return $"{path}{args}{desc}";
             });
@@ -48,9 +45,9 @@ public sealed class CoreModule(InteractionService svc) : InteractionModuleBase<S
         var embed = new EmbedBuilder()
             .WithTitle("Help")
             .WithDescription(body)
-            .WithColor(new Color(0x5865F2)) // Discord blurple
+            .WithColor(new Color(0x5865F2))
             .Build();
 
-        await RespondAsync(embed: embed, ephemeral: false);
+        await RespondAsync(embed: embed, ephemeral: true);
     }
 }
