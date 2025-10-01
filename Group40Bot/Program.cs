@@ -10,55 +10,105 @@ using Microsoft.Extensions.Logging;
 
 /*
 SUMMARY (EN):
-- Bootstraps a Generic Host with DI, logging and config.
-- Wires DiscordSocketClient + InteractionService.
+- Bootstraps a .NET Generic Host with DI, logging, and configuration sources.
+- Wires up DiscordSocketClient and InteractionService.
 - BotRunner logs in, loads modules, registers slash-commands per guild on Ready and when joining new guilds.
-- No TEST_GUILD_ID needed anymore; commands deploy instantly to all guilds the bot is in.
+- No TEST_GUILD_ID needed; commands deploy instantly per guild.
 */
-
 var host = Host.CreateDefaultBuilder(args)
-  .ConfigureAppConfiguration(cfg => cfg
-    .AddJsonFile("appsettings.json", optional: true, reloadOnChange: true)
-    .AddUserSecrets<Program>(optional: true)
-    .AddEnvironmentVariables())
-  .ConfigureLogging(l => l.ClearProviders().AddConsole())
-  .ConfigureServices((ctx, s) =>
-{
-    var intents = GatewayIntents.Guilds
-               | GatewayIntents.GuildMembers
-               | GatewayIntents.GuildVoiceStates
-               | GatewayIntents.GuildMessageReactions; // needed for reaction roles
-
-    s.AddSingleton(new DiscordSocketClient(new DiscordSocketConfig
+    // ===== LOGGING: console sink + minimum level =====
+    .ConfigureLogging(l => l
+        .ClearProviders()
+        .AddConsole()
+        .SetMinimumLevel(LogLevel.Information))
+    // ===== CONFIG: appsettings + UserSecrets + ENV =====
+    .ConfigureAppConfiguration(cfg => cfg
+        .AddJsonFile("appsettings.json", optional: true, reloadOnChange: true)
+        .AddUserSecrets<Program>(optional: true)
+        .AddEnvironmentVariables())
+    // ===== DEPENDENCY INJECTION / SERVICES =====
+    .ConfigureServices((ctx, s) =>
     {
-        GatewayIntents = intents,
-        LogLevel = LogSeverity.Info,
-        MessageCacheSize = 0,
-        AlwaysDownloadUsers = false
-    }));
-    s.AddSingleton(sp => new InteractionService(sp.GetRequiredService<DiscordSocketClient>()));
+        // NOTE: GuildMembers intent must be enabled in the Developer Portal if kept here.
+        var intents = GatewayIntents.Guilds
+                   | GatewayIntents.GuildMembers
+                   | GatewayIntents.GuildVoiceStates
+                   | GatewayIntents.GuildMessageReactions;
 
-    s.AddSingleton<ISettingsStore, FileSettingsStore>();
-    s.AddHostedService<TempVoiceService>();
-    s.AddHostedService<ReactionRoleService>();  // NEW
-    s.AddHostedService<BotRunner>();
-})
-  .Build();
+        s.AddSingleton(new DiscordSocketClient(new DiscordSocketConfig
+        {
+            GatewayIntents = intents,
+            LogLevel = LogSeverity.Info,
+            MessageCacheSize = 0,
+            AlwaysDownloadUsers = false
+        }));
+
+        // InteractionService needs the client in its constructor
+        s.AddSingleton(sp => new InteractionService(sp.GetRequiredService<DiscordSocketClient>()));
+
+        s.AddSingleton<ISettingsStore, FileSettingsStore>();
+        s.AddHostedService<TempVoiceService>();
+        s.AddHostedService<ReactionRoleService>();   // enable if you use reaction roles
+        s.AddHostedService<BotRunner>();
+    })
+    .Build();
 
 await host.RunAsync();
 
+/// <summary>
+/// Background service that owns the Discord client lifecycle:
+/// logging hooks, module loading, command execution, and per-guild registration.
+/// </summary>
 public sealed class BotRunner(
-  DiscordSocketClient client,
-  InteractionService interactions,
-  IServiceProvider services,
-  IConfiguration cfg,
-  ILogger<BotRunner> log) : BackgroundService
+    DiscordSocketClient client,
+    InteractionService interactions,
+    IServiceProvider services,
+    IConfiguration cfg,
+    ILogger<BotRunner> log) : BackgroundService
 {
     protected override async Task ExecuteAsync(CancellationToken ct)
     {
+        // ===== LOGGING: base logs from Discord.Net & InteractionService =====
         client.Log += m => { log.LogInformation("{Src} {Msg}", m.Source, m.Message); return Task.CompletedTask; };
         interactions.Log += m => { log.LogInformation("{Src} {Msg}", m.Source, m.Message); return Task.CompletedTask; };
 
+        // ===== LOGGING: connection diagnostics (connect/disconnect; WS close code when available) =====
+        client.Connected += () =>
+        {
+            log.LogInformation("Connected");
+            return Task.CompletedTask;
+        };
+        client.Disconnected += ex =>
+        {
+            switch (ex)
+            {
+                case Discord.Net.WebSocketClosedException wse:
+                    // CloseCode + Reason available here
+                    log.LogError("Disconnected: CloseCode={Code} Reason={Reason}", wse.CloseCode, wse.Reason);
+                    break;
+                default:
+                    // No close code available (e.g., other exceptions)
+                    log.LogError(ex, "Disconnected: {Type}", ex?.GetType().Name ?? "unknown");
+                    break;
+            }
+            return Task.CompletedTask;
+        };
+
+        // ===== LOGGING: guild availability =====
+        client.GuildAvailable += g => { log.LogInformation("Guild available: {Name} ({Id})", g.Name, g.Id); return Task.CompletedTask; };
+        client.GuildUnavailable += g => { log.LogWarning("Guild unavailable: {Name} ({Id})", g.Name, g.Id); return Task.CompletedTask; };
+
+        // ===== LOGGING: slash command results =====
+        interactions.SlashCommandExecuted += (info, ctx, result) =>
+        {
+            if (!result.IsSuccess)
+                log.LogError("Slash error {Cmd}: {Error} {Reason}", info.Name, result.Error, result.ErrorReason);
+            else
+                log.LogInformation("Slash ok {Cmd} by {User} in {Guild}", info.Name, ctx.User?.Id, (ctx.Guild?.Id.ToString() ?? "DM"));
+            return Task.CompletedTask;
+        };
+
+        // ===== EVENTS: ready / joined guild / interaction dispatch =====
         client.Ready += OnReady;
         client.JoinedGuild += g => RegisterForGuildAsync(g.Id);
         client.InteractionCreated += async inter =>
@@ -67,20 +117,31 @@ public sealed class BotRunner(
             await interactions.ExecuteCommandAsync(ctx, services);
         };
 
+        // ===== MODULE DISCOVERY =====
         await interactions.AddModulesAsync(Assembly.GetExecutingAssembly(), services);
 
+        // ===== LOGIN / START =====
         var token = cfg["DISCORD_TOKEN"] ?? throw new InvalidOperationException("DISCORD_TOKEN missing.");
         await client.LoginAsync(TokenType.Bot, token);
         await client.StartAsync();
 
-        try { await Task.Delay(Timeout.Infinite, ct); } catch { }
+        try { await Task.Delay(Timeout.Infinite, ct); } catch { /* ignore */ }
     }
 
     private async Task OnReady()
     {
-        foreach (var g in client.Guilds)
-            await RegisterForGuildAsync(g.Id);
-        log.LogInformation("Slash-commands registered for {Count} guild(s).", client.Guilds.Count);
+        try
+        {
+            foreach (var g in client.Guilds)
+                await RegisterForGuildAsync(g.Id);
+
+            log.LogInformation("Slash-commands registered for {Count} guild(s).", client.Guilds.Count);
+        }
+        catch (Exception ex)
+        {
+            // ===== LOGGING: ready handler errors =====
+            log.LogError(ex, "Ready handler failed");
+        }
     }
 
     private Task RegisterForGuildAsync(ulong guildId)
