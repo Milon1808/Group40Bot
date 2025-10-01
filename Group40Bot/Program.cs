@@ -49,6 +49,7 @@ var host = Host.CreateDefaultBuilder(args)
         s.AddHostedService<TempVoiceService>();
         s.AddHostedService<ReactionRoleService>();
         s.AddHostedService<BotRunner>();
+        s.AddHostedService<PresenceService>();   // periodic presence rotation
     })
     .Build();
 
