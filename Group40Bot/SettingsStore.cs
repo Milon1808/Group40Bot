@@ -9,6 +9,7 @@ namespace Group40Bot;
 /// Abstraction for guild-scoped settings:
 /// - Temp voice lobbies per guild
 /// - Reaction-role messages per guild
+/// Adds structured logging with UTC timestamps and full context.
 /// </summary>
 public interface ISettingsStore
 {
@@ -27,13 +28,15 @@ public interface ISettingsStore
 /// <summary>
 /// File-backed implementation designed for servers:
 /// - Resolves a stable data directory (ENV -> config -> OS default)
-/// - Logs the absolute file path
+/// - Logs the absolute file path and load results
 /// - Backs up corrupt JSON and starts empty
 /// - Atomic write (temp + replace)
 /// - Backward compatible with legacy lobby-only schema
 /// </summary>
 public sealed class FileSettingsStore : ISettingsStore
 {
+    private static string Ts() => DateTimeOffset.UtcNow.ToString("yyyy-MM-dd HH:mm:ss 'UTC'");
+
     private readonly string _file;
     private readonly ILogger<FileSettingsStore> _log;
     private readonly SemaphoreSlim _lock = new(1, 1);
@@ -47,10 +50,13 @@ public sealed class FileSettingsStore : ISettingsStore
         Directory.CreateDirectory(dir);
 
         _file = Path.Combine(dir, "settings.json");
-        _log.LogInformation("Settings file: {Path}", _file);
+        _log.LogInformation("[{Ts}] Settings file: {Path}", Ts(), _file);
 
         if (!File.Exists(_file))
+        {
+            _log.LogInformation("[{Ts}] Settings file not found. Starting with empty store.", Ts());
             return;
+        }
 
         try
         {
@@ -63,17 +69,20 @@ public sealed class FileSettingsStore : ISettingsStore
                 var legacy = JsonSerializer.Deserialize<Dictionary<ulong, HashSet<ulong>>>(json);
                 if (legacy != null) _root.Lobbies = legacy;
             }
+
+            _log.LogInformation("[{Ts}] Settings loaded. Guilds(lobbies):{L} Guilds(reactionRoles):{R}",
+                Ts(), _root.Lobbies.Count, _root.ReactionRoles.Count);
         }
         catch (JsonException ex)
         {
             var backup = _file + $".corrupt-{DateTime.UtcNow:yyyyMMddHHmmss}.json";
-            try { File.Move(_file, backup, true); } catch { }
-            _log.LogWarning(ex, "Settings corrupted. Moved to {Backup}. Starting empty.", backup);
+            try { File.Move(_file, backup, true); } catch { /* ignore move failure */ }
+            _log.LogWarning(ex, "[{Ts}] Settings corrupted. Moved to {Backup}. Starting empty.", Ts(), backup);
             _root = new SettingsRoot();
         }
         catch (Exception ex)
         {
-            _log.LogWarning(ex, "Failed to load settings; starting empty");
+            _log.LogWarning(ex, "[{Ts}] Failed to load settings; starting empty", Ts());
             _root = new SettingsRoot();
         }
     }
@@ -100,16 +109,26 @@ public sealed class FileSettingsStore : ISettingsStore
     /// <summary>Atomic write: temp file + replace to avoid torn writes.</summary>
     private void Save()
     {
-        Directory.CreateDirectory(Path.GetDirectoryName(_file)!);
-        var json = JsonSerializer.Serialize(_root, new JsonSerializerOptions { WriteIndented = true });
-
-        var tmp = _file + ".tmp";
-        File.WriteAllText(tmp, json);
-        try { File.Replace(tmp, _file, null); }
-        catch
+        try
         {
-            if (File.Exists(_file)) File.Delete(_file);
-            File.Move(tmp, _file);
+            Directory.CreateDirectory(Path.GetDirectoryName(_file)!);
+            var json = JsonSerializer.Serialize(_root, new JsonSerializerOptions { WriteIndented = true });
+
+            var tmp = _file + ".tmp";
+            File.WriteAllText(tmp, json);
+            try { File.Replace(tmp, _file, null); }
+            catch
+            {
+                if (File.Exists(_file)) File.Delete(_file);
+                File.Move(tmp, _file);
+            }
+
+            _log.LogInformation("[{Ts}] Settings saved. Lobbies:{L} ReactionMessages:{R}",
+                Ts(), _root.Lobbies.Sum(kv => kv.Value.Count), _root.ReactionRoles.Sum(kv => kv.Value.Count));
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "[{Ts}] Settings save failed", Ts());
         }
     }
 
@@ -124,8 +143,12 @@ public sealed class FileSettingsStore : ISettingsStore
         {
             if (!_root.Lobbies.TryGetValue(guildId, out var set))
                 _root.Lobbies[guildId] = set = new HashSet<ulong>();
-            set.Add(channelId);
+
+            var added = set.Add(channelId);
             Save();
+
+            _log.LogInformation("[{Ts}] lobby/add guild:{Guild} channel:{Chan} added:{Added} total:{Total}",
+                Ts(), guildId, channelId, added, set.Count);
         }
         finally { _lock.Release(); }
     }
@@ -137,8 +160,15 @@ public sealed class FileSettingsStore : ISettingsStore
         {
             if (_root.Lobbies.TryGetValue(guildId, out var set))
             {
-                set.Remove(channelId);
+                var removed = set.Remove(channelId);
                 Save();
+
+                _log.LogInformation("[{Ts}] lobby/remove guild:{Guild} channel:{Chan} removed:{Removed} remaining:{Total}",
+                    Ts(), guildId, channelId, removed, set.Count);
+            }
+            else
+            {
+                _log.LogInformation("[{Ts}] lobby/remove guild:{Guild} no-set", Ts(), guildId);
             }
         }
         finally { _lock.Release(); }
@@ -154,9 +184,13 @@ public sealed class FileSettingsStore : ISettingsStore
                 _root.ReactionRoles[entry.GuildId] = list = new List<ReactionRoleEntry>();
 
             var idx = list.FindIndex(x => x.MessageId == entry.MessageId);
-            if (idx >= 0) list[idx] = entry; else list.Add(entry);
+            var isUpdate = idx >= 0;
+            if (isUpdate) list[idx] = entry; else list.Add(entry);
 
             Save();
+
+            _log.LogInformation("[{Ts}] rr/add guild:{Guild} msg:{Msg} pairs:{Pairs} updated:{Updated} totalForGuild:{Total}",
+                Ts(), entry.GuildId, entry.MessageId, entry.Pairs.Count, isUpdate, list.Count);
         }
         finally { _lock.Release(); }
     }
@@ -168,8 +202,18 @@ public sealed class FileSettingsStore : ISettingsStore
         {
             if (_root.ReactionRoles.TryGetValue(guildId, out var list))
             {
+                var before = list.Count;
                 list.RemoveAll(x => x.MessageId == messageId);
+                var removed = before - list.Count;
+
                 Save();
+
+                _log.LogInformation("[{Ts}] rr/remove guild:{Guild} msg:{Msg} removed:{Removed} remaining:{Total}",
+                    Ts(), guildId, messageId, removed, list.Count);
+            }
+            else
+            {
+                _log.LogInformation("[{Ts}] rr/remove guild:{Guild} no-list", Ts(), guildId);
             }
         }
         finally { _lock.Release(); }

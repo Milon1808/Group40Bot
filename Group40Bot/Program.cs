@@ -1,4 +1,5 @@
-﻿using System.Reflection;
+﻿using System.Linq;
+using System.Reflection;
 using Discord;
 using Discord.Interactions;
 using Discord.WebSocket;
@@ -10,25 +11,27 @@ using Microsoft.Extensions.Logging;
 
 /*
 SUMMARY (EN):
-- Bootstraps a .NET Generic Host with DI, logging, and configuration.
-- Registers DiscordSocketClient and InteractionService.
-- Starts the bot via BotRunner; registers slash-commands per guild on Ready and when joining new guilds.
+- Bootstraps Generic Host.
+- Adds console logging with UTC timestamps.
+- Enriches event logging with guild/user context.
+- Registers per-guild slash commands on Ready and on new guilds.
 */
 var host = Host.CreateDefaultBuilder(args)
-    // ===== LOGGING: console sink + minimum level =====
     .ConfigureLogging(l => l
         .ClearProviders()
-        .AddConsole()
+        .AddSimpleConsole(o =>
+        {
+            o.TimestampFormat = "yyyy-MM-dd HH:mm:ss 'UTC' ";
+            o.UseUtcTimestamp = true;
+            o.SingleLine = true;
+        })
         .SetMinimumLevel(LogLevel.Information))
-    // ===== CONFIG: appsettings + UserSecrets + ENV =====
     .ConfigureAppConfiguration(cfg => cfg
         .AddJsonFile("appsettings.json", optional: true, reloadOnChange: true)
         .AddUserSecrets<Program>(optional: true)
         .AddEnvironmentVariables())
-    // ===== DEPENDENCY INJECTION / SERVICES =====
     .ConfigureServices((ctx, s) =>
     {
-        // NOTE: Keep GuildMembers intent only if enabled in the Developer Portal.
         var intents = GatewayIntents.Guilds
                    | GatewayIntents.GuildMembers
                    | GatewayIntents.GuildVoiceStates
@@ -42,23 +45,18 @@ var host = Host.CreateDefaultBuilder(args)
             AlwaysDownloadUsers = false
         }));
 
-        // InteractionService requires the client in its ctor
         s.AddSingleton(sp => new InteractionService(sp.GetRequiredService<DiscordSocketClient>()));
 
         s.AddSingleton<ISettingsStore, FileSettingsStore>();
         s.AddHostedService<TempVoiceService>();
         s.AddHostedService<ReactionRoleService>();
+        s.AddHostedService<PresenceService>();
         s.AddHostedService<BotRunner>();
-        s.AddHostedService<PresenceService>();   // periodic presence rotation
     })
     .Build();
 
 await host.RunAsync();
 
-/// <summary>
-/// Owns Discord client lifecycle: hooks logging, loads modules,
-/// handles interaction dispatching, and per-guild command registration.
-/// </summary>
 public sealed class BotRunner(
     DiscordSocketClient client,
     InteractionService interactions,
@@ -66,60 +64,65 @@ public sealed class BotRunner(
     IConfiguration cfg,
     ILogger<BotRunner> log) : BackgroundService
 {
+    private static string Ts() => DateTimeOffset.UtcNow.ToString("yyyy-MM-dd HH:mm:ss 'UTC'");
+    private static string GSummary(IGuild g) => $"{g.Name}({g.Id})";
+    private string GuildsSummary() => client.Guilds.Count == 0 ? "<none>" : string.Join(", ", client.Guilds.Select(GSummary));
+
     protected override async Task ExecuteAsync(CancellationToken ct)
     {
-        // ===== LOGGING: base logs from Discord.Net & InteractionService =====
-        client.Log += m => { log.LogInformation("{Src} {Msg}", m.Source, m.Message); return Task.CompletedTask; };
-        interactions.Log += m => { log.LogInformation("{Src} {Msg}", m.Source, m.Message); return Task.CompletedTask; };
+        client.Log += m => { log.LogInformation("[{Ts}] {Src} {Msg}", Ts(), m.Source, m.Message); return Task.CompletedTask; };
+        interactions.Log += m => { log.LogInformation("[{Ts}] {Src} {Msg}", Ts(), m.Source, m.Message); return Task.CompletedTask; };
 
-        // ===== LOGGING: connection diagnostics =====
-        client.Connected += () => { log.LogInformation("Connected"); return Task.CompletedTask; };
+        client.Connected += () => { log.LogInformation("[{Ts}] Connected", Ts()); return Task.CompletedTask; };
         client.Disconnected += ex =>
         {
             switch (ex)
             {
                 case Discord.Net.WebSocketClosedException wse:
-                    log.LogError("Disconnected: CloseCode={Code} Reason={Reason}", wse.CloseCode, wse.Reason);
+                    log.LogError("[{Ts}] Disconnected: CloseCode={Code} Reason={Reason}", Ts(), wse.CloseCode, wse.Reason);
                     break;
                 default:
-                    log.LogError(ex, "Disconnected: {Type}", ex?.GetType().Name ?? "unknown");
+                    log.LogError(ex, "[{Ts}] Disconnected: {Type}", Ts(), ex?.GetType().Name ?? "unknown");
                     break;
             }
             return Task.CompletedTask;
         };
 
-        // ===== LOGGING: guild availability =====
-        client.GuildAvailable += g => { log.LogInformation("Guild available: {Name} ({Id})", g.Name, g.Id); return Task.CompletedTask; };
-        client.GuildUnavailable += g => { log.LogWarning("Guild unavailable: {Name} ({Id})", g.Name, g.Id); return Task.CompletedTask; };
+        client.GuildAvailable += g => { log.LogInformation("[{Ts}] Guild available: {G}", Ts(), GSummary(g)); return Task.CompletedTask; };
+        client.GuildUnavailable += g => { log.LogWarning("[{Ts}] Guild unavailable: {G}", Ts(), GSummary(g)); return Task.CompletedTask; };
+        client.JoinedGuild += g => { log.LogInformation("[{Ts}] Joined guild: {G}", Ts(), GSummary(g)); return RegisterForGuildAsync(g.Id); };
+        client.LeftGuild += g => { log.LogInformation("[{Ts}] Left guild: {Id}", Ts(), g.Id); return Task.CompletedTask; };
 
-        // ===== LOGGING: slash result =====
-        interactions.SlashCommandExecuted += (info, ctx, result) =>
-        {
-            if (!result.IsSuccess)
-                log.LogError("Slash error {Cmd}: {Error} {Reason}", info.Name, result.Error, result.ErrorReason);
-            else
-                log.LogInformation("Slash ok {Cmd} by {User} in {Guild}", info.Name, ctx.User?.Id, (ctx.Guild?.Id.ToString() ?? "DM"));
-            return Task.CompletedTask;
-        };
-
-        // ===== EVENTS =====
-        client.Ready += OnReady;
-        client.JoinedGuild += g => RegisterForGuildAsync(g.Id);
         client.InteractionCreated += async inter =>
         {
+            var g = inter.GuildId.HasValue ? client.GetGuild(inter.GuildId.Value) : null;
+            log.LogInformation("[{Ts}] Interaction created type:{Type} in:{Guild} by:{User}",
+                Ts(), inter.Type, g is null ? "DM" : GSummary(g), inter.User?.Id);
             var ctx = new SocketInteractionContext(client, inter);
             await interactions.ExecuteCommandAsync(ctx, services);
         };
 
-        // ===== MODULE DISCOVERY =====
+        interactions.SlashCommandExecuted += (info, ctx, result) =>
+        {
+            var gtxt = ctx.Guild is null ? "DM" : GSummary(ctx.Guild);
+            if (!result.IsSuccess)
+                log.LogError("[{Ts}] Slash error {Cmd}: {Error} {Reason} by:{User} in:{Guild}",
+                    Ts(), info.Name, result.Error, result.ErrorReason, ctx.User?.Id, gtxt);
+            else
+                log.LogInformation("[{Ts}] Slash ok {Cmd} by:{User} in:{Guild}",
+                    Ts(), info.Name, ctx.User?.Id, gtxt);
+            return Task.CompletedTask;
+        };
+
         await interactions.AddModulesAsync(Assembly.GetExecutingAssembly(), services);
 
-        // ===== LOGIN / START =====
         var token = cfg["DISCORD_TOKEN"] ?? throw new InvalidOperationException("DISCORD_TOKEN missing.");
         await client.LoginAsync(TokenType.Bot, token);
         await client.StartAsync();
 
-        try { await Task.Delay(Timeout.Infinite, ct); } catch { /* ignore */ }
+        client.Ready += OnReady;
+
+        try { await Task.Delay(Timeout.Infinite, ct); } catch { }
     }
 
     private async Task OnReady()
@@ -129,11 +132,11 @@ public sealed class BotRunner(
             foreach (var g in client.Guilds)
                 await RegisterForGuildAsync(g.Id);
 
-            log.LogInformation("Slash-commands registered for {Count} guild(s).", client.Guilds.Count);
+            log.LogInformation("[{Ts}] Ready. Guilds:{Count} [{List}]", Ts(), client.Guilds.Count, GuildsSummary());
         }
         catch (Exception ex)
         {
-            log.LogError(ex, "Ready handler failed");
+            log.LogError(ex, "[{Ts}] Ready handler failed", Ts());
         }
     }
 
@@ -142,8 +145,10 @@ public sealed class BotRunner(
 
     public override async Task StopAsync(CancellationToken ct)
     {
+        log.LogInformation("[{Ts}] Stopping...", Ts());
         await client.StopAsync();
         await client.LogoutAsync();
         await base.StopAsync(ct);
+        log.LogInformation("[{Ts}] Stopped.", Ts());
     }
 }
