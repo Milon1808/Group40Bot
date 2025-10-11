@@ -52,6 +52,7 @@ var host = Host.CreateDefaultBuilder(args)
         s.AddHostedService<ReactionRoleService>();
         s.AddHostedService<PresenceService>();
         s.AddHostedService<BotRunner>();
+        s.AddHostedService<GiveawayService>();
     })
     .Build();
 

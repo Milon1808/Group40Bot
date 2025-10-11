@@ -23,6 +23,13 @@ public interface ISettingsStore
     Task RemoveReactionRoleAsync(ulong guildId, ulong messageId);
     Task<ReactionRoleEntry?> GetReactionRoleByMessageAsync(ulong guildId, ulong messageId);
     Task<List<ReactionRoleEntry>> ListReactionRolesAsync(ulong guildId);
+
+    // Giveaways
+    Task AddOrUpdateGiveawayAsync(GiveawayEntry entry);
+    Task<List<GiveawayEntry>> ListGiveawaysAsync(ulong guildId);
+    Task<GiveawayEntry?> GetGiveawayByIdAsync(ulong guildId, Guid id);
+    Task<GiveawayEntry?> GetGiveawayByMessageAsync(ulong guildId, ulong messageId);
+    Task RemoveGiveawayAsync(ulong guildId, Guid id);
 }
 
 /// <summary>
@@ -87,6 +94,61 @@ public sealed class FileSettingsStore : ISettingsStore
         }
     }
 
+        // -------- Giveaways --------
+    public async Task AddOrUpdateGiveawayAsync(GiveawayEntry entry)
+        {
+            await _lock.WaitAsync();
+            try
+            {
+                if (!_root.Giveaways.TryGetValue(entry.GuildId, out var list))
+                    _root.Giveaways[entry.GuildId] = list = new List<GiveawayEntry>();
+
+                var idx = list.FindIndex(g => g.Id == entry.Id);
+                if (idx >= 0) list[idx] = entry; else list.Add(entry);
+                Save();
+
+                _log.LogInformation("[{Ts}] gw/save guild:{G} id:{Id} status:{S} start:{Start:u} end:{End:u}",
+                    DateTimeOffset.UtcNow, entry.GuildId, entry.Id, entry.Status, entry.StartUtc, entry.EndUtc);
+            }
+            finally { _lock.Release(); }
+        }
+
+    public Task<List<GiveawayEntry>> ListGiveawaysAsync(ulong guildId)
+    {
+        if (_root.Giveaways.TryGetValue(guildId, out var list))
+            return Task.FromResult(list.OrderBy(g => g.StartUtc).ToList());
+        return Task.FromResult(new List<GiveawayEntry>());
+    }
+
+    public Task<GiveawayEntry?> GetGiveawayByIdAsync(ulong guildId, Guid id)
+    {
+        if (_root.Giveaways.TryGetValue(guildId, out var list))
+            return Task.FromResult<GiveawayEntry?>(list.FirstOrDefault(g => g.Id == id));
+        return Task.FromResult<GiveawayEntry?>(null);
+    }
+
+    public Task<GiveawayEntry?> GetGiveawayByMessageAsync(ulong guildId, ulong messageId)
+    {
+        if (_root.Giveaways.TryGetValue(guildId, out var list))
+            return Task.FromResult<GiveawayEntry?>(list.FirstOrDefault(g => g.MessageId == messageId));
+        return Task.FromResult<GiveawayEntry?>(null);
+    }
+
+    public async Task RemoveGiveawayAsync(ulong guildId, Guid id)
+    {
+        await _lock.WaitAsync();
+        try
+        {
+            if (_root.Giveaways.TryGetValue(guildId, out var list))
+            {
+                var before = list.Count;
+                list.RemoveAll(g => g.Id == id);
+                if (before != list.Count) Save();
+            }
+        }
+        finally { _lock.Release(); }
+    }
+    
     /// <summary>Resolve data directory: ENV:DATA_DIR -> config:DataDir -> OS default.</summary>
     private static string ResolveDataDir(IConfiguration cfg)
     {
@@ -239,6 +301,7 @@ public sealed class SettingsRoot
 {
     public Dictionary<ulong, HashSet<ulong>> Lobbies { get; set; } = new();
     public Dictionary<ulong, List<ReactionRoleEntry>> ReactionRoles { get; set; } = new();
+    public Dictionary<ulong, List<GiveawayEntry>> Giveaways { get; set; } = new();
 }
 
 /// <summary>One reaction-role message and its emoji-to-role mapping.</summary>
@@ -260,4 +323,37 @@ public sealed class ReactionRolePair
     public ReactionRolePair() { }
     public ReactionRolePair(string emojiKey, ulong roleId, string? emojiRaw)
         => (EmojiKey, RoleId, EmojiRaw) = (emojiKey, roleId, emojiRaw);
+}
+
+public enum GiveawayStatus
+{
+    Scheduled = 0,
+    Active = 1,
+    Completed = 2,
+    Cancelled = 3
+}
+
+/// <summary>One scheduled/active/completed giveaway persisted to disk.</summary>
+public sealed class GiveawayEntry
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+    public ulong GuildId { get; set; }
+    public ulong ChannelId { get; set; }
+    public ulong MessageId { get; set; } // set when posted
+    public string Title { get; set; } = "";
+    public string Body { get; set; } = "";
+    public string EmojiKey { get; set; } = "🎉";
+    public string EmojiRaw { get; set; } = "🎉";
+    public List<ulong> ExcludedRoleIds { get; set; } = new();
+    public bool ExcludeBots { get; set; } = true;
+
+    public DateTimeOffset StartUtc { get; set; }
+    public DateTimeOffset EndUtc { get; set; }
+    public GiveawayStatus Status { get; set; } = GiveawayStatus.Scheduled;
+
+    //winner (null if not decided yet)
+    public ulong? WinnerUserId { get; set; }
+
+    //Tracked participants
+    public HashSet<ulong> ParticipantIds { get; set; } = new();
 }
