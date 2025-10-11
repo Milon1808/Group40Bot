@@ -47,12 +47,28 @@ var host = Host.CreateDefaultBuilder(args)
 
         s.AddSingleton(sp => new InteractionService(sp.GetRequiredService<DiscordSocketClient>()));
 
+        //File Settings
         s.AddSingleton<ISettingsStore, FileSettingsStore>();
+        
+        //Tempvoice Service
         s.AddHostedService<TempVoiceService>();
+        
+        //Reaction Roles
         s.AddHostedService<ReactionRoleService>();
+        
+        //Presence Services
         s.AddHostedService<PresenceService>();
+        
         s.AddHostedService<BotRunner>();
+        
+        //Giveaway Services
         s.AddHostedService<GiveawayService>();
+
+        // Dice system
+        s.AddSingleton<IDiceRoller, DiceRoller>();
+        s.AddSingleton<RollMemory>();
+        s.AddHostedService<DiceRerollService>();
+        
     })
     .Build();
 
